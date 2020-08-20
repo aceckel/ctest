@@ -27,12 +27,12 @@ extern "C" {
 #endif
 
 #include <inttypes.h> /* intmax_t, uintmax_t, PRI* */
-#include <stddef.h> /* size_t */
+#include <stddef.h> /* size_t, offsetof */
+#include <string.h> /* strcmp */
 
 typedef void (*ctest_nullary_run_func)(void);
 typedef void (*ctest_unary_run_func)(void*);
-typedef void (*ctest_setup_func)(void*);
-typedef void (*ctest_teardown_func)(void*);
+typedef void (*ctest_fixture_func)(void*);
 
 union ctest_run_func_union {
     ctest_nullary_run_func nullary;
@@ -61,107 +61,225 @@ union ctest_run_func_union {
 #define CTEST_IMPL_DIAG_POP()
 #endif
 
+struct ctest_impl_list_head {
+    struct ctest_impl_list_head* next;
+    struct ctest_impl_list_head* prev;
+};
+
+#define CTEST_IMPL_LIST_HEAD_INIT(head) { &(head), &(head) }
+
+static inline void ctest_impl_list_add_between(struct ctest_impl_list_head* prev,
+                                               struct ctest_impl_list_head* curr,
+                                               struct ctest_impl_list_head* next)
+{
+    prev->next = curr;
+    curr->prev = prev;
+    curr->next = next;
+    next->prev = curr;
+}
+
+static inline void ctest_impl_list_add_tail(struct ctest_impl_list_head* node,
+                                            struct ctest_impl_list_head* head)
+{
+    ctest_impl_list_add_between(head->prev, node, head);
+}
+
+struct ctest_impl_slist_head {
+    struct ctest_impl_slist_head* next;
+};
+
+#define CTEST_IMPL_SLIST_HEAD_INIT(head) { &(head) }
+
+static inline void ctest_impl_slist_add(struct ctest_impl_slist_head* node,
+                                        struct ctest_impl_slist_head* head)
+{
+    node->next = head->next;
+    head->next = node;
+}
+
+#define ctest_impl_list_entry(head, type, member) \
+    ((type*) ((char*) (head) - offsetof(type, member)))
+
+#define ctest_impl_list_for_each_entry(iter, head, type, member) \
+    for (iter = ctest_impl_list_entry((head)->next, type, member); \
+         &iter->member != (head); \
+         iter = ctest_impl_list_entry(iter->member.next, type, member))
+
+#define DECLARE_HASHTABLE(name, size) \
+    struct ctest_impl_slist_head name[size];
+
+#define DEFINE_HASHTABLE(name, size...) \
+    struct ctest_impl_slist_head name[size]; \
+    __attribute__ ((constructor)) void name##_ctor(void) \
+    { \
+        ctest_impl_hash_init_once(name); \
+    }
+
+#define CTEST_IMPL_ARRAY_SIZE(array) \
+    (sizeof(array) / sizeof(*(array)))
+
+static inline void ctest_impl_hash_init_helper(struct ctest_impl_slist_head* heads, size_t size)
+{
+    for (size_t i = 0; i < size; ++i) {
+        heads[i] = (struct ctest_impl_slist_head)CTEST_IMPL_SLIST_HEAD_INIT(heads[i]);
+    }
+}
+#define ctest_impl_hash_init(hashtable) \
+    ctest_impl_hash_init_helper(hashtable, CTEST_IMPL_ARRAY_SIZE(hashtable))
+
+static inline void ctest_impl_hash_init_once_helper(struct ctest_impl_slist_head* heads, size_t size)
+{
+    if (heads[0].next == NULL) {
+        ctest_impl_hash_init_helper(heads, size);
+    }
+}
+#define ctest_impl_hash_init_once(hashtable) \
+    ctest_impl_hash_init_once_helper(hashtable, CTEST_IMPL_ARRAY_SIZE(hashtable))
+
+static inline void ctest_impl_slist_add_helper(struct ctest_impl_slist_head* heads, size_t size,
+                                               struct ctest_impl_slist_head* node,
+                                               unsigned int key)
+{
+    ctest_impl_slist_add(node, &heads[key % size]);
+}
+#define ctest_impl_hash_add(hashtable, node, key) \
+    ctest_impl_slist_add_helper(hashtable, CTEST_IMPL_ARRAY_SIZE(hashtable), \
+                                node, key)
+
+#define ctest_impl_hash_for_each_possible(hashtable, iter, type, member, key) \
+    ctest_impl_list_for_each_entry(iter, \
+                                   &(hashtable)[(key) % (CTEST_IMPL_ARRAY_SIZE(hashtable))], \
+                                   type, member)
+
+static inline unsigned int ctest_impl_fnv1a32(const void* s, size_t size)
+{
+    return (
+        (size ? ctest_impl_fnv1a32(s, size - 1) : 2166136261)
+        ^ (unsigned int)((const char*)s)[size]
+    ) * 16777619;
+}
+
+extern struct ctest_impl_list_head ctest_impl_test_list;
+extern DECLARE_HASHTABLE(ctest_impl_suite_hashtable, 1024);
+
 struct ctest {
     const char* ssname;  // suite name
     const char* ttname;  // test name
     union ctest_run_func_union run;
 
     void* data;
-    ctest_setup_func* setup;
-    ctest_teardown_func* teardown;
+    struct ctest_impl_list_head list;
 
     int skip;
-
-    unsigned int magic;
 };
+
+struct ctest_impl_suite {
+    const char* name;
+    void (*setup)(void*);
+    void (*teardown)(void*);
+    struct ctest_impl_slist_head list;
+};
+
+static inline unsigned int ctest_impl_hash_suite(const char* sname)
+{
+    return ctest_impl_fnv1a32(sname, strlen(sname));
+}
+
+static inline struct ctest_impl_suite* ctest_impl_find_suite(const char* sname)
+{
+    const unsigned int key = ctest_impl_hash_suite(sname);
+    struct ctest_impl_suite* iter;
+    ctest_impl_hash_for_each_possible(ctest_impl_suite_hashtable,
+                                      iter, struct ctest_impl_suite, list, key) {
+        if (strcmp(iter->name, sname) == 0) {
+            return iter;
+        }
+    }
+    return NULL;
+}
+
+static inline void ctest_impl_add_suite(struct ctest_impl_suite* suite)
+{
+    ctest_impl_hash_add(ctest_impl_suite_hashtable, &suite->list,
+                        ctest_impl_hash_suite(suite->name));
+}
+
+static inline struct ctest_impl_suite* ctest_impl_emplace_suite(struct ctest_impl_suite* suite)
+{
+    struct ctest_impl_suite* const found = ctest_impl_find_suite(suite->name);
+    if (found != NULL) {
+        return found;
+    }
+
+    ctest_impl_add_suite(suite);
+    return suite;
+}
 
 #define CTEST_IMPL_NAME(name) ctest_##name
 #define CTEST_IMPL_FNAME(sname, tname) CTEST_IMPL_NAME(sname##_##tname##_run)
 #define CTEST_IMPL_TNAME(sname, tname) CTEST_IMPL_NAME(sname##_##tname)
+#define CTEST_IMPL_CNAME(sname, tname) CTEST_IMPL_NAME(sname##_##tname##_ctor)
 #define CTEST_IMPL_DATA_SNAME(sname) CTEST_IMPL_NAME(sname##_data)
 #define CTEST_IMPL_DATA_TNAME(sname, tname) CTEST_IMPL_NAME(sname##_##tname##_data)
 #define CTEST_IMPL_SETUP_FNAME(sname) CTEST_IMPL_NAME(sname##_setup)
-#define CTEST_IMPL_SETUP_FPNAME(sname) CTEST_IMPL_NAME(sname##_setup_ptr)
-#define CTEST_IMPL_SETUP_TPNAME(sname, tname) CTEST_IMPL_NAME(sname##_##tname##_setup_ptr)
+#define CTEST_IMPL_SETUP_CNAME(sname) CTEST_IMPL_NAME(sname##_setup_ctor)
 #define CTEST_IMPL_TEARDOWN_FNAME(sname) CTEST_IMPL_NAME(sname##_teardown)
-#define CTEST_IMPL_TEARDOWN_FPNAME(sname) CTEST_IMPL_NAME(sname##_teardown_ptr)
-#define CTEST_IMPL_TEARDOWN_TPNAME(sname, tname) CTEST_IMPL_NAME(sname##_##tname##_teardown_ptr)
+#define CTEST_IMPL_TEARDOWN_CNAME(sname) CTEST_IMPL_NAME(sname##_teardown_ctor)
 
-#define CTEST_IMPL_MAGIC (0xdeadbeef)
-#ifdef __APPLE__
-#define CTEST_IMPL_SECTION __attribute__ ((used, section ("__DATA, .ctest"), aligned(1)))
-#else
-#define CTEST_IMPL_SECTION __attribute__ ((used, section (".ctest"), aligned(1)))
-#endif
-
-#define CTEST_IMPL_STRUCT(sname, tname, tskip, tdata, tsetup, tteardown) \
-    static struct ctest CTEST_IMPL_TNAME(sname, tname) CTEST_IMPL_SECTION = { \
+#define CTEST_IMPL_STRUCT(sname, tname, tskip, tdata) \
+    static struct ctest CTEST_IMPL_TNAME(sname, tname) = { \
         #sname, \
         #tname, \
         { (ctest_nullary_run_func) CTEST_IMPL_FNAME(sname, tname) }, \
         tdata, \
-        (ctest_setup_func*) tsetup, \
-        (ctest_teardown_func*) tteardown, \
+        CTEST_IMPL_LIST_HEAD_INIT(CTEST_IMPL_TNAME(sname, tname).list), \
         tskip, \
-        CTEST_IMPL_MAGIC, \
+    }; \
+    __attribute__ ((constructor)) static void CTEST_IMPL_CNAME(sname, tname)(void) \
+    { \
+        ctest_impl_list_add_tail(&CTEST_IMPL_TNAME(sname, tname).list, \
+                                 &ctest_impl_test_list); \
     }
 
-#ifdef __cplusplus
+#define CTEST_IMPL_FIXTURE(sname, member, FNAME, CNAME) \
+    __attribute__ ((constructor)) static void CNAME(sname)(void) \
+    { \
+        ctest_impl_hash_init_once(ctest_impl_suite_hashtable); \
+        static struct ctest_impl_suite suite = { \
+            #sname, \
+            NULL, \
+            NULL, \
+            CTEST_IMPL_SLIST_HEAD_INIT(suite.list), \
+        }; \
+        struct ctest_impl_suite* const emplaced = ctest_impl_emplace_suite(&suite); \
+        emplaced->member = (ctest_fixture_func) &FNAME(sname); \
+    }
 
 #define CTEST_SETUP(sname) \
-    template <> void CTEST_IMPL_SETUP_FNAME(sname)(struct CTEST_IMPL_DATA_SNAME(sname)* data)
-
-#define CTEST_TEARDOWN(sname) \
-    template <> void CTEST_IMPL_TEARDOWN_FNAME(sname)(struct CTEST_IMPL_DATA_SNAME(sname)* data)
-
-#define CTEST_DATA(sname) \
-    template <typename T> void CTEST_IMPL_SETUP_FNAME(sname)(T* data) { } \
-    template <typename T> void CTEST_IMPL_TEARDOWN_FNAME(sname)(T* data) { } \
-    struct CTEST_IMPL_DATA_SNAME(sname)
-
-#define CTEST_IMPL_CTEST(sname, tname, tskip) \
-    static void CTEST_IMPL_FNAME(sname, tname)(void); \
-    CTEST_IMPL_STRUCT(sname, tname, tskip, NULL, NULL, NULL); \
-    static void CTEST_IMPL_FNAME(sname, tname)(void)
-
-#define CTEST_IMPL_CTEST2(sname, tname, tskip) \
-    static struct CTEST_IMPL_DATA_SNAME(sname) CTEST_IMPL_DATA_TNAME(sname, tname); \
-    static void CTEST_IMPL_FNAME(sname, tname)(struct CTEST_IMPL_DATA_SNAME(sname)* data); \
-    static void (*CTEST_IMPL_SETUP_TPNAME(sname, tname))(struct CTEST_IMPL_DATA_SNAME(sname)*) = &CTEST_IMPL_SETUP_FNAME(sname)<struct CTEST_IMPL_DATA_SNAME(sname)>; \
-    static void (*CTEST_IMPL_TEARDOWN_TPNAME(sname, tname))(struct CTEST_IMPL_DATA_SNAME(sname)*) = &CTEST_IMPL_TEARDOWN_FNAME(sname)<struct CTEST_IMPL_DATA_SNAME(sname)>; \
-    CTEST_IMPL_STRUCT(sname, tname, tskip, &CTEST_IMPL_DATA_TNAME(sname, tname), &CTEST_IMPL_SETUP_TPNAME(sname, tname), &CTEST_IMPL_TEARDOWN_TPNAME(sname, tname)); \
-    static void CTEST_IMPL_FNAME(sname, tname)(struct CTEST_IMPL_DATA_SNAME(sname)* data)
-
-#else
-
-#define CTEST_SETUP(sname) \
+    CTEST_DATA(sname); \
     static void CTEST_IMPL_SETUP_FNAME(sname)(struct CTEST_IMPL_DATA_SNAME(sname)* data); \
-    static void (*CTEST_IMPL_SETUP_FPNAME(sname))(struct CTEST_IMPL_DATA_SNAME(sname)*) = &CTEST_IMPL_SETUP_FNAME(sname); \
+    CTEST_IMPL_FIXTURE(sname, setup, CTEST_IMPL_SETUP_FNAME, CTEST_IMPL_SETUP_CNAME) \
     static void CTEST_IMPL_SETUP_FNAME(sname)(struct CTEST_IMPL_DATA_SNAME(sname)* data)
 
 #define CTEST_TEARDOWN(sname) \
+    CTEST_DATA(sname); \
     static void CTEST_IMPL_TEARDOWN_FNAME(sname)(struct CTEST_IMPL_DATA_SNAME(sname)* data); \
-    static void (*CTEST_IMPL_TEARDOWN_FPNAME(sname))(struct CTEST_IMPL_DATA_SNAME(sname)*) = &CTEST_IMPL_TEARDOWN_FNAME(sname); \
+    CTEST_IMPL_FIXTURE(sname, teardown, CTEST_IMPL_TEARDOWN_FNAME, CTEST_IMPL_TEARDOWN_CNAME) \
     static void CTEST_IMPL_TEARDOWN_FNAME(sname)(struct CTEST_IMPL_DATA_SNAME(sname)* data)
 
 #define CTEST_DATA(sname) \
-    struct CTEST_IMPL_DATA_SNAME(sname); \
-    static void (*CTEST_IMPL_SETUP_FPNAME(sname))(struct CTEST_IMPL_DATA_SNAME(sname)*); \
-    static void (*CTEST_IMPL_TEARDOWN_FPNAME(sname))(struct CTEST_IMPL_DATA_SNAME(sname)*); \
     struct CTEST_IMPL_DATA_SNAME(sname)
 
 #define CTEST_IMPL_CTEST(sname, tname, tskip) \
     static void CTEST_IMPL_FNAME(sname, tname)(void); \
-    CTEST_IMPL_STRUCT(sname, tname, tskip, NULL, NULL, NULL); \
+    CTEST_IMPL_STRUCT(sname, tname, tskip, NULL); \
     static void CTEST_IMPL_FNAME(sname, tname)(void)
 
 #define CTEST_IMPL_CTEST2(sname, tname, tskip) \
     static struct CTEST_IMPL_DATA_SNAME(sname) CTEST_IMPL_DATA_TNAME(sname, tname); \
     static void CTEST_IMPL_FNAME(sname, tname)(struct CTEST_IMPL_DATA_SNAME(sname)* data); \
-    CTEST_IMPL_STRUCT(sname, tname, tskip, &CTEST_IMPL_DATA_TNAME(sname, tname), &CTEST_IMPL_SETUP_FPNAME(sname), &CTEST_IMPL_TEARDOWN_FPNAME(sname)); \
+    CTEST_IMPL_STRUCT(sname, tname, tskip, &CTEST_IMPL_DATA_TNAME(sname, tname)); \
     static void CTEST_IMPL_FNAME(sname, tname)(struct CTEST_IMPL_DATA_SNAME(sname)* data)
-
-#endif
 
 void CTEST_LOG(const char* fmt, ...) CTEST_IMPL_FORMAT_PRINTF(1, 2);
 void CTEST_ERR(const char* fmt, ...) CTEST_IMPL_FORMAT_PRINTF(1, 2);  // doesn't return
@@ -228,12 +346,14 @@ void assert_dbl_far(double exp, double real, double tol, const char* caller, int
 #include <setjmp.h>
 #include <stdarg.h>
 #include <stdio.h>
-#include <string.h>
 #include <sys/time.h>
 #include <unistd.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <wchar.h>
+
+struct ctest_impl_list_head ctest_impl_test_list = CTEST_IMPL_LIST_HEAD_INIT(ctest_impl_test_list);
+DEFINE_HASHTABLE(ctest_impl_suite_hashtable);
 
 static size_t ctest_errorsize;
 static char* ctest_errormsg;
@@ -262,8 +382,6 @@ typedef int (*ctest_filter_func)(struct ctest*);
 #define ANSI_BCYAN    "\033[01;36m"
 #define ANSI_WHITE    "\033[01;37m"
 #define ANSI_NORMAL   "\033[0m"
-
-CTEST(suite, test) { }
 
 static void vprint_errormsg(const char* const fmt, va_list ap) CTEST_IMPL_FORMAT_PRINTF(1, 0);
 static void print_errormsg(const char* const fmt, ...) CTEST_IMPL_FORMAT_PRINTF(1, 2);
@@ -488,9 +606,7 @@ static void sighandler(int signum)
 }
 #endif
 
-int ctest_main(int argc, const char *argv[]);
-
-__attribute__((no_sanitize_address)) int ctest_main(int argc, const char *argv[])
+int ctest_main(int argc, const char *argv[])
 {
     static int total = 0;
     static int num_ok = 0;
@@ -513,30 +629,14 @@ __attribute__((no_sanitize_address)) int ctest_main(int argc, const char *argv[]
     color_output = isatty(1);
 #endif
     uint64_t t1 = getCurrentTime();
-
-    struct ctest* ctest_begin = &CTEST_IMPL_TNAME(suite, test);
-    struct ctest* ctest_end = &CTEST_IMPL_TNAME(suite, test);
-    // find begin and end of section by comparing magics
-    while (1) {
-        struct ctest* t = ctest_begin-1;
-        if (t->magic != CTEST_IMPL_MAGIC) break;
-        ctest_begin--;
-    }
-    while (1) {
-        struct ctest* t = ctest_end+1;
-        if (t->magic != CTEST_IMPL_MAGIC) break;
-        ctest_end++;
-    }
-    ctest_end++;    // end after last one
-
     static struct ctest* test;
-    for (test = ctest_begin; test != ctest_end; test++) {
-        if (test == &CTEST_IMPL_TNAME(suite, test)) continue;
+    static struct ctest_impl_suite* suite;
+
+    ctest_impl_list_for_each_entry(test, &ctest_impl_test_list, struct ctest, list) {
         if (filter(test)) total++;
     }
 
-    for (test = ctest_begin; test != ctest_end; test++) {
-        if (test == &CTEST_IMPL_TNAME(suite, test)) continue;
+    ctest_impl_list_for_each_entry(test, &ctest_impl_test_list, struct ctest, list) {
         if (filter(test)) {
             ctest_errorbuffer[0] = 0;
             ctest_errorsize = MSG_SIZE-1;
@@ -549,12 +649,13 @@ __attribute__((no_sanitize_address)) int ctest_main(int argc, const char *argv[]
             } else {
                 int result = setjmp(ctest_err);
                 if (result == 0) {
-                    if (test->setup && *test->setup) (*test->setup)(test->data);
+                    suite = ctest_impl_find_suite(test->ssname);
+                    if (suite && suite->setup && test->data) suite->setup(test->data);
                     if (test->data)
                         test->run.unary(test->data);
                     else
                         test->run.nullary();
-                    if (test->teardown && *test->teardown) (*test->teardown)(test->data);
+                    if (suite && suite->teardown && test->data) suite->teardown(test->data);
                     // if we got here it's ok
 #ifdef CTEST_COLOR_OK
                     color_print(ANSI_BGREEN, "[OK]");
@@ -587,4 +688,3 @@ __attribute__((no_sanitize_address)) int ctest_main(int argc, const char *argv[]
 #endif
 
 #endif
-
